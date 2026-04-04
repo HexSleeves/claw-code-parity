@@ -198,6 +198,18 @@ pub enum TelemetryEvent {
         #[serde(default, skip_serializing_if = "Map::is_empty")]
         attributes: Map<String, Value>,
     },
+    LaneOpen {
+        session_id: String,
+        lane_id: String,
+        #[serde(default, skip_serializing_if = "Map::is_empty")]
+        attributes: Map<String, Value>,
+    },
+    LaneClose {
+        session_id: String,
+        lane_id: String,
+        #[serde(default, skip_serializing_if = "Map::is_empty")]
+        attributes: Map<String, Value>,
+    },
     Analytics(AnalyticsEvent),
     SessionTrace(SessionTraceRecord),
 }
@@ -394,6 +406,26 @@ impl SessionTracer {
         self.record("http_request_failed", trace_attributes);
     }
 
+    pub fn record_lane_open(&self, lane_id: impl Into<String>, attributes: Map<String, Value>) {
+        let lane_id = lane_id.into();
+        self.sink.record(TelemetryEvent::LaneOpen {
+            session_id: self.session_id.clone(),
+            lane_id: lane_id.clone(),
+            attributes: attributes.clone(),
+        });
+        self.record("lane_open", merge_lane_trace_fields(lane_id, attributes));
+    }
+
+    pub fn record_lane_close(&self, lane_id: impl Into<String>, attributes: Map<String, Value>) {
+        let lane_id = lane_id.into();
+        self.sink.record(TelemetryEvent::LaneClose {
+            session_id: self.session_id.clone(),
+            lane_id: lane_id.clone(),
+            attributes: attributes.clone(),
+        });
+        self.record("lane_close", merge_lane_trace_fields(lane_id, attributes));
+    }
+
     pub fn record_analytics(&self, event: AnalyticsEvent) {
         let mut attributes = event.properties.clone();
         attributes.insert(
@@ -415,6 +447,14 @@ fn merge_trace_fields(
     attributes.insert("method".to_string(), Value::String(method));
     attributes.insert("path".to_string(), Value::String(path));
     attributes.insert("attempt".to_string(), Value::from(attempt));
+    attributes
+}
+
+fn merge_lane_trace_fields(
+    lane_id: String,
+    mut attributes: Map<String, Value>,
+) -> Map<String, Value> {
+    attributes.insert("lane_id".to_string(), Value::String(lane_id));
     attributes
 }
 
@@ -477,6 +517,12 @@ mod tests {
         let sink = Arc::new(MemoryTelemetrySink::default());
         let tracer = SessionTracer::new("session-123", sink.clone());
 
+        let mut lane_open_attributes = Map::new();
+        lane_open_attributes.insert("worker".to_string(), Value::String("worker-1".to_string()));
+        tracer.record_lane_open("lane-42", lane_open_attributes);
+        let mut lane_close_attributes = Map::new();
+        lane_close_attributes.insert("status".to_string(), Value::String("completed".to_string()));
+        tracer.record_lane_close("lane-42", lane_close_attributes);
         tracer.record_http_request_started(1, "POST", "/v1/messages", Map::new());
         tracer.record_analytics(
             AnalyticsEvent::new("cli", "prompt_sent")
@@ -486,6 +532,32 @@ mod tests {
         let events = sink.events();
         assert!(matches!(
             &events[0],
+            TelemetryEvent::LaneOpen {
+                session_id,
+                lane_id,
+                ..
+            } if session_id == "session-123" && lane_id == "lane-42"
+        ));
+        assert!(matches!(
+            &events[1],
+            TelemetryEvent::SessionTrace(SessionTraceRecord { sequence: 0, name, attributes, .. })
+            if name == "lane_open" && attributes.get("lane_id") == Some(&Value::String("lane-42".to_string()))
+        ));
+        assert!(matches!(
+            &events[2],
+            TelemetryEvent::LaneClose {
+                session_id,
+                lane_id,
+                ..
+            } if session_id == "session-123" && lane_id == "lane-42"
+        ));
+        assert!(matches!(
+            &events[3],
+            TelemetryEvent::SessionTrace(SessionTraceRecord { sequence: 1, name, attributes, .. })
+            if name == "lane_close" && attributes.get("lane_id") == Some(&Value::String("lane-42".to_string()))
+        ));
+        assert!(matches!(
+            &events[4],
             TelemetryEvent::HttpRequestStarted {
                 session_id,
                 attempt: 1,
@@ -495,16 +567,42 @@ mod tests {
             } if session_id == "session-123" && method == "POST" && path == "/v1/messages"
         ));
         assert!(matches!(
-            &events[1],
-            TelemetryEvent::SessionTrace(SessionTraceRecord { sequence: 0, name, .. })
+            &events[5],
+            TelemetryEvent::SessionTrace(SessionTraceRecord { sequence: 2, name, .. })
             if name == "http_request_started"
         ));
-        assert!(matches!(&events[2], TelemetryEvent::Analytics(_)));
+        assert!(matches!(&events[6], TelemetryEvent::Analytics(_)));
         assert!(matches!(
-            &events[3],
-            TelemetryEvent::SessionTrace(SessionTraceRecord { sequence: 1, name, .. })
+            &events[7],
+            TelemetryEvent::SessionTrace(SessionTraceRecord { sequence: 3, name, .. })
             if name == "analytics"
         ));
+    }
+
+    #[test]
+    fn jsonl_sink_persists_lane_events() {
+        let path = std::env::temp_dir().join(format!(
+            "telemetry-jsonl-lane-{}.log",
+            current_timestamp_ms()
+        ));
+        let sink = JsonlTelemetrySink::new(&path).expect("sink should create file");
+
+        sink.record(TelemetryEvent::LaneOpen {
+            session_id: "session-123".to_string(),
+            lane_id: "lane-42".to_string(),
+            attributes: Map::new(),
+        });
+        sink.record(TelemetryEvent::LaneClose {
+            session_id: "session-123".to_string(),
+            lane_id: "lane-42".to_string(),
+            attributes: Map::new(),
+        });
+
+        let contents = std::fs::read_to_string(&path).expect("telemetry log should be readable");
+        assert!(contents.contains("\"type\":\"lane_open\""));
+        assert!(contents.contains("\"type\":\"lane_close\""));
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
